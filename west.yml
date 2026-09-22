@@ -1,0 +1,26 @@
+# West 清单：把本仓库声明为一个 Zephyr 应用仓库
+#
+# 作用：让 `west init -m <本仓库>` 能自动拉取 Zephyr 源码与全部依赖模块。
+# 没有这个文件，CI 里的 `west init` 会直接失败（这是第一次构建失败的原因）。
+#
+# 工作区布局（west init -m 之后）：
+#   <workspace>/app      <- 本仓库
+#   <workspace>/zephyr   <- Zephyr 内核
+#   <workspace>/modules  <- 各依赖模块
+#
+# 版本选择：v4.1.0 是稳定发行版，且已确认其中的
+#   boards/others/promicro_nrf52840 提供 nrf52840/uf2 构建目标。
+
+manifest:
+  self:
+    path: app
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.1.0
+      import: true

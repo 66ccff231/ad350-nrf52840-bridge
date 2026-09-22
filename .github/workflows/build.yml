@@ -1,13 +1,13 @@
 # 在 GitHub 上自动编译固件 —— 不需要你本地安装 nRF Connect SDK
 #
-# 设计说明：
-#   不用容器（container:），因为容器任务里 actions/checkout 常因 git
-#   「dubious ownership」失败（容器内是 root，workspace 属主不同）。
-#   改为在标准 ubuntu runner 上装 west + Zephyr SDK，多花一点时间但稳定。
+# 拓扑：本仓库是 west 清单仓库，west init -m 会建立工作区，
+#       本仓库落在 <workspace>/app，Zephyr 落在 <workspace>/zephyr。
 #
-# 用法：
-#   推送后自动构建 → Actions 页面下载 artifacts 里的 zephyr.uf2
-#   如果报 board not found，改下面的 BOARD 变量
+# 已确认（查过 mainline Zephyr v4.1.0）：
+#   boards/others/promicro_nrf52840 提供 nrf52840/uf2 目标，
+#   board.cmake 里带 CONFIG_BUILD_OUTPUT_UF2 支持，能产出 UF2。
+#
+# 用法：推送后自动构建 → Actions 页面下载 artifacts 里的 zephyr.uf2
 
 name: Build nRF52840 firmware
 
@@ -18,14 +18,12 @@ on:
 env:
   BOARD: promicro_nrf52840/nrf52840/uf2
   ZEPHYR_SDK_VERSION: 0.17.0
+  APP_REPO: https://github.com/66ccff231/xds-nrf52840-bridge.git
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -34,45 +32,54 @@ jobs:
             wget python3 python3-pip python3-setuptools python3-tk python3-wheel \
             xz-utils file make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
 
-      - name: Install west and Zephyr dependencies
+      - name: Install west
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install west
 
-      - name: Init west workspace (Zephyr 4.x)
+      - name: Init west workspace
         run: |
-          west init -l .
+          west init -m "${APP_REPO}" --mr main ws
+          cd ws
           west update --narrow -o=--depth=1
           west zephyr-export
 
       - name: Install Python requirements
-        run: python3 -m pip install -r zephyr/scripts/requirements.txt
+        run: python3 -m pip install -r ws/zephyr/scripts/requirements.txt
 
       - name: Install Zephyr SDK
         run: |
-          cd ..
           wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64.tar.xz
           tar xf zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64.tar.xz
           cd zephyr-sdk-${ZEPHYR_SDK_VERSION}
           ./setup.sh -c
           echo "ZEPHYR_SDK_INSTALL_DIR=$PWD" >> $GITHUB_ENV
 
+      - name: Confirm board is available
+        run: |
+          cd ws
+          echo "--- 与 promicro 相关的板子 ---"
+          west boards | grep -i promicro || echo "(没找到 promicro 板)"
+          echo "--- 构建目标是否存在 ---"
+          west boards -b "${BOARD}" 2>&1 | head -5 || true
+
       - name: Build firmware
         run: |
-          west build -b "$BOARD" . --pristine
+          cd ws/app
+          west build -b "${BOARD}" . --pristine
 
       - name: Show what was produced
         if: always()
         run: |
           echo "--- 产物 ---"
-          ls -la build/zephyr/ 2>/dev/null | head -30 || echo "build 目录不存在"
+          ls -la ws/app/build/zephyr/ 2>/dev/null | head -40 || echo "build 目录不存在"
 
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
           name: xds-bridge-uf2
           path: |
-            build/zephyr/zephyr.uf2
-            build/zephyr/zephyr.hex
-            build/zephyr/zephyr.elf
+            ws/app/build/zephyr/zephyr.uf2
+            ws/app/build/zephyr/zephyr.hex
+            ws/app/build/zephyr/zephyr.elf
           if-no-files-found: warn
