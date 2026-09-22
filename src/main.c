@@ -135,6 +135,13 @@ static void led_init(void)
 
 /** 标准 Cycling Power 服务 —— 我们的 GATT 服务与广播都用这个 */
 #define CPS_SERVICE_UUID16      0x1818
+/** GAP Appearance：0x0484 = "Cycling: Power Sensor"。
+ *  取自蓝牙标准 Assigned Numbers 的 Appearance 表；
+ *  很多运动 app 按这个字段筛选功率计，不广播就可能搜不到。 */
+#define CPS_APPEARANCE          0x0484
+/** Cycling Power Sensor Location 特征的值：5 = Left Crank。
+ *  XDS 这台是曲柄功率计，报「左曲柄」最贴切。 */
+#define CPS_SENSOR_LOCATION     0x05
 /** 实测 XDS 功率计广播里出现的 UUID，用于扫描匹配 */
 #define XDS_ADV_UUID16          0x1828
 /** Cycling Power Measurement：功率数据在这里 */
@@ -264,6 +271,16 @@ static ssize_t read_feature(struct bt_conn *conn,
                              sizeof(feature));
 }
 
+/** Sensor Location：1 字节，说明功率计装在哪儿（5 = 左曲柄）。
+ *  有些 app 连上后会读它。 */
+static ssize_t read_sensor_location(struct bt_conn *conn,
+                                    const struct bt_gatt_attr *attr,
+                                    void *buf, uint16_t len, uint16_t offset)
+{
+    static const uint8_t loc = CPS_SENSOR_LOCATION;
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &loc, sizeof(loc));
+}
+
 static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     ARG_UNUSED(attr);
@@ -282,11 +299,14 @@ static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
     BT_UUID_128_ENCODE(0x00002a63, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 #define BT_UUID_CPF_VAL \
     BT_UUID_128_ENCODE(0x00002a65, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+#define BT_UUID_CPL_VAL \
+    BT_UUID_128_ENCODE(0x00002a5b, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 
 static struct bt_uuid_128 uuid_cps = BT_UUID_INIT_128(BT_UUID_CPS_VAL);
 static struct bt_uuid_128 uuid_xds = BT_UUID_INIT_128(BT_UUID_XDS_VAL);
 static struct bt_uuid_128 uuid_cpm = BT_UUID_INIT_128(BT_UUID_CPM_VAL);
 static struct bt_uuid_128 uuid_cpf = BT_UUID_INIT_128(BT_UUID_CPF_VAL);
+static struct bt_uuid_128 uuid_cpl = BT_UUID_INIT_128(BT_UUID_CPL_VAL);
 
 /* 注意下标：cps_attrs[1] 必须是测量特征（notify 时按句柄取它） */
 static struct bt_gatt_attr cps_attrs[] = {
@@ -300,6 +320,10 @@ static struct bt_gatt_attr cps_attrs[] = {
                            BT_GATT_CHRC_READ,
                            BT_GATT_PERM_READ,
                            read_feature, NULL, NULL),
+    BT_GATT_CHARACTERISTIC(&uuid_cpl.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           read_sensor_location, NULL, NULL),
 };
 
 static struct bt_gatt_service cps_svc = BT_GATT_SERVICE(cps_attrs);
@@ -783,9 +807,14 @@ static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     /* 对外广播必须是标准功率服务 0x1818，手机/码表按它过滤 */
     BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(CPS_SERVICE_UUID16)),
+    /* Appearance 必须广播！0x0484 = "Cycling: Power Sensor"（小端存放）。
+     * 很多运动 app 按 Appearance 筛选功率计，缺了这个字段就搜不到本机 ——
+     * 行者 app 连不上大概率就是这个原因。 */
+    BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE,
+                  (CPS_APPEARANCE & 0xFF), (CPS_APPEARANCE >> 8)),
     BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, sizeof(DEVICE_NAME) - 1),
 };
-/* 共 3+4+17 = 24 字节，在 31 字节的 legacy 广播上限内，不需要扫描响应 */
+/* 3 + 4 + 4 + 17 = 28 字节，仍在 31 字节 legacy 广播上限内 */
 
 static const struct bt_le_adv_param adv_param =
     BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONN,
