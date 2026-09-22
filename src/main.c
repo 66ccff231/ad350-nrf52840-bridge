@@ -563,7 +563,7 @@ static void log_seen_device(const struct bt_le_scan_recv_info *info, bool has_cp
 {
     for (uint8_t i = 0U; i < seen_count; i++)
     {
-        if (bt_addr_le_cmp(&info->addr, &seen_addrs[i]) == 0)
+        if (bt_addr_le_cmp(info->addr, &seen_addrs[i]) == 0)
         {
             return;   /* 已经打过 */
         }
@@ -572,10 +572,10 @@ static void log_seen_device(const struct bt_le_scan_recv_info *info, bool has_cp
     {
         seen_count = 0U;   /* 表满就重新开始记 */
     }
-    seen_addrs[seen_count] = info->addr;
+    seen_addrs[seen_count] = *info->addr;
     seen_count++;
 
-    LOG_INF("扫描到 %s  rssi %d dBm  %s", bt_addr_le_str(&info->addr),
+    LOG_INF("扫描到 %s  rssi %d dBm  %s", bt_addr_le_str(info->addr),
             info->rssi, has_cps ? "带 0x1828 <<<" : "无 0x1828");
 }
 
@@ -604,7 +604,7 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
     bt_id_get(own, &own_count);
     for (size_t i = 0U; i < own_count; i++)
     {
-        if (bt_addr_le_cmp(&info->addr, &own[i]) == 0)
+        if (bt_addr_le_cmp(info->addr, &own[i]) == 0)
         {
             return;   /* 这是自己 */
         }
@@ -615,14 +615,17 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
         return;   /* 不是功率计 */
     }
 
-    LOG_INF("发现功率计 %s，停止扫描后连接", bt_addr_le_str(&info->addr));
+    LOG_INF("发现功率计 %s，停止扫描后连接", bt_addr_le_str(info->addr));
     SET_STATE(ST_CONNECTING);
 
     /* 不能在这里直接停止扫描并连接：
      * scan_recv 跑在蓝牙接收线程上，就地调 bt_le_scan_stop() 有死锁风险，
      * 而且扫描未真正停止时 bt_conn_le_create() 会返回 -EAGAIN。
-     * 所以丢给系统工作队列去做。 */
-    memcpy(&pending_addr, &info->addr, sizeof(pending_addr));
+     * 所以丢给系统工作队列去做。
+     *
+     * 注意 info->addr 是**指针**，要解引用再拷 —— 之前写成 &info->addr
+     * 等于把指针本身的内存当地址用，连的自然是垃圾地址。 */
+    pending_addr = *info->addr;
     scan_connecting = true;
     k_work_submit(&connect_work);
 }
