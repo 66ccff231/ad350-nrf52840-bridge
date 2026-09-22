@@ -174,6 +174,7 @@ static bool scan_connecting;           /* 是否正在「停扫描 -> 发起连�
 static bool scan_running;              /* 我们自己记录扫描状态。
                                         * Zephyr 4.1 没有公开的
                                         * bt_le_scan_is_started()，所以自己记。 */
+static bool adv_running;               /* 广播是否开着（连接后会停，需自己重启） */
 static uint32_t connect_retry_after_ms; /* 连接失败后的退避截止时刻 */
 
 /* ------------------------------------------------------------------ */
@@ -517,6 +518,9 @@ static void sensor_disconnected(struct bt_conn *conn, uint8_t reason)
     SET_STATE(ST_SCANNING);
 }
 
+/* 前向声明：连接断开回调里要重启广播，而该函数定义在后面 */
+static void start_advertising(void);
+
 /* 码表连进来 */
 static void client_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -526,6 +530,10 @@ static void client_connected(struct bt_conn *conn, uint8_t err)
     }
     LOG_INF("码表/手机已连接");
     client_conn = bt_conn_ref(conn);
+
+    /* 可连接广播在建立连接后会自动停止，这里同步标志，
+     * 让断开后（或主循环兜底）能重新开起来。 */
+    adv_running = false;
 }
 
 static void client_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -538,6 +546,10 @@ static void client_disconnected(struct bt_conn *conn, uint8_t reason)
     }
     atomic_set(&ccc_enabled, 0);
     LOG_INF("码表/手机已断开");
+
+    /* 关键：Zephyr 不会在断开后自动恢复广播。
+     * 不重启的话，手机连过一次之后就永远搜不到本机了（实测就是这样）。 */
+    start_advertising();
 }
 
 /* 连接回调：用同一组回调，按是哪个连接区分角色 */
@@ -781,6 +793,30 @@ static const struct bt_le_adv_param adv_param =
                          BT_GAP_ADV_FAST_INT_MAX_2,
                          NULL);
 
+/** @brief 开始（或重新开始）广播。
+ *
+ * 为什么需要重复调用：可连接广播在建立连接后会**自动停止**，
+ * Zephyr 不会自己恢复。不手动重启的话，手机/码表连过一次之后
+ * 就再也搜不到本机了 —— 这是实测踩到的坑。 */
+static void start_advertising(void)
+{
+    int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+
+    if (err == 0)
+    {
+        adv_running = true;
+        LOG_INF("已开始广播「%s」，服务 0x1818（标准功率服务）", DEVICE_NAME);
+    }
+    else if (err == -EALREADY)
+    {
+        adv_running = true;   /* 已经在广播 */
+    }
+    else
+    {
+        LOG_ERR("启动广播失败 (err %d)", err);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* 主函数                                                              */
 /* ------------------------------------------------------------------ */
@@ -816,14 +852,12 @@ int main(void)
     }
 
     /* 广播数据里必须带上 0x1818，否则手机/码表按服务过滤时搜不到我们 */
-    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err != 0)
+    start_advertising();
+    if (!adv_running)
     {
-        LOG_ERR("启动广播失败 (err %d)", err);
         SET_STATE(ST_ERROR);
-        return err;
+        return -EIO;
     }
-    LOG_INF("已开始广播「%s」，服务 0x1818（标准功率服务）", DEVICE_NAME);
 
     /* 持续扫描功率计 */
     start_scan();
@@ -847,6 +881,14 @@ int main(void)
         if ((sensor_conn == NULL) && !scan_running && !scan_connecting)
         {
             start_scan();
+        }
+
+        /* 兜底：没有手机/码表连着却不在广播，就重新开广播。
+         * （正常路径在 client_disconnected 里重启，这里防意外情况） */
+        if (!adv_running && (client_conn == NULL))
+        {
+            LOG_WRN("广播不在运行，重新开启");
+            start_advertising();
         }
 
         /* 没数据时也定期推 0，让码表知道桥还活着 */
