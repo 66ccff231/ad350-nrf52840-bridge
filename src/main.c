@@ -3,11 +3,11 @@
  * ======================================
  *
  * 数据流：
- *   XDS 功率计 --BLE 0x2A63--> 本机（Central） --BLE 0x1828 CPS--> 码表 / 行者 app
+ *   XDS 功率计 --BLE 0x2A63--> 本机（Central） --BLE 0x1818 CPS--> 码表 / 行者 app
  *
  * 本机同时扮演两个角色：
  *   1. Central：扫描并连接 XDS 功率计，订阅 0x2A63 拿测量数据
- *   2. Peripheral：以标准 Cycling Power 服务（0x1828）广播，供码表连接
+ *   2. Peripheral：以标准 Cycling Power 服务（0x1818）广播，供码表连接
  *
  * 为什么不做 ANT+：
  *   Garmin/ANT 许可明确禁止在非 Nordic 原厂 nRF52 芯片上使用 ANT SoftDevice
@@ -119,12 +119,30 @@ static void led_init(void)
 /* 配置                                                                */
 /* ------------------------------------------------------------------ */
 
-/** 标准 Cycling Power 服务（用于扫描判定） */
-#define XDS_SERVICE_UUID16      0x1828
+/* ------------------------------------------------------------------ */
+/* UUID 定义                                                           */
+/*                                                                     */
+/* ⚠️ 这里有两个不同的 UUID，别搞混：                                    */
+/*   CPS_SERVICE_UUID16 = 0x1818 是**标准自行车功率服务**，             */
+/*                        我们自己广播/提供的必须是它（手机/码表认它）  */
+/*   XDS_ADV_UUID16     = 0x1828 是实测中 XDS 功率计广播里带的 UUID    */
+/*                        （它按道理该用 0x1818，但实测就是 0x1828），  */
+/*                        扫描时用它来认功率计                          */
+/*                                                                     */
+/* 早先版本把两者混用成 0x1828，结果本机把自己广播成了「蓝牙网格代理」  */
+/* 服务，行者 app 扫功率服务自然找不到它。                              */
+/* ------------------------------------------------------------------ */
+
+/** 标准 Cycling Power 服务 —— 我们的 GATT 服务与广播都用这个 */
+#define CPS_SERVICE_UUID16      0x1818
+/** 实测 XDS 功率计广播里出现的 UUID，用于扫描匹配 */
+#define XDS_ADV_UUID16          0x1828
 /** Cycling Power Measurement：功率数据在这里 */
 #define XDS_MEAS_CHAR_UUID16    0x2A63
-/** Cycling Power Control Point（0x2A55）：xds_forwarding 会写启动命令
- *  {02 16 AA 10} 到这里。实测本设备返回 0x81 拒绝，且不发也能收到测量数据，
+/** Cycling Power Feature：部分 app 连接后会读它 */
+#define CPS_FEATURE_CHAR_UUID16 0x2A65
+/** Cycling Power Control Point（0x2A66）。xds_forwarding 会写启动命令
+ *  {02 16 AA 10}，实测本设备返回 0x81 拒绝，且不发也能收到测量数据，
  *  所以本固件不实现这一步；若日后需要，见 README「已知未完成项」。 */
 #define XDS_CTRL_CHAR_UUID16    0x2A55
 
@@ -221,7 +239,9 @@ static void build_measurement(uint16_t power_w)
 }
 
 /* ------------------------------------------------------------------ */
-/* GATT 服务：标准 Cycling Power（0x1828），只暴露测量特征与 CCCD      */
+/* GATT 服务：标准 Cycling Power（0x1818）                             */
+/*   我们对外提供的服务必须是标准 0x1818 —— 手机/码表按它过滤。         */
+/*   功率计自己用的 0x1828 只用于我们做 Central 时去发现它（见 uuid_xds）*/
 /* ------------------------------------------------------------------ */
 
 static ssize_t read_measurement(struct bt_conn *conn,
@@ -232,6 +252,17 @@ static ssize_t read_measurement(struct bt_conn *conn,
                              measurement_buf, sizeof(measurement_buf));
 }
 
+/** Cycling Power Feature：0 表示不支持可选特性。
+ *  不少 app 连上后会读它，没有这个特征可能导致连接后被判为不兼容。 */
+static ssize_t read_feature(struct bt_conn *conn,
+                            const struct bt_gatt_attr *attr,
+                            void *buf, uint16_t len, uint16_t offset)
+{
+    static const uint8_t feature[4] = {0x00, 0x00, 0x00, 0x00};
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, feature,
+                             sizeof(feature));
+}
+
 static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     ARG_UNUSED(attr);
@@ -240,15 +271,23 @@ static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
     LOG_INF("客户端%s了通知", on ? "开启" : "关闭");
 }
 
-/* 用 128 位完整形式写标准 UUID，避免依赖 UUID 类型注册 */
+/* 用 128 位完整形式写 UUID，避免依赖 UUID 类型注册。
+ * 注意 0x1818（我们的服务）与 0x1828（功率计的服务）是两个不同的东西。 */
 #define BT_UUID_CPS_VAL \
+    BT_UUID_128_ENCODE(0x00001818, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+#define BT_UUID_XDS_VAL \
     BT_UUID_128_ENCODE(0x00001828, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 #define BT_UUID_CPM_VAL \
     BT_UUID_128_ENCODE(0x00002a63, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
+#define BT_UUID_CPF_VAL \
+    BT_UUID_128_ENCODE(0x00002a65, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 
 static struct bt_uuid_128 uuid_cps = BT_UUID_INIT_128(BT_UUID_CPS_VAL);
+static struct bt_uuid_128 uuid_xds = BT_UUID_INIT_128(BT_UUID_XDS_VAL);
 static struct bt_uuid_128 uuid_cpm = BT_UUID_INIT_128(BT_UUID_CPM_VAL);
+static struct bt_uuid_128 uuid_cpf = BT_UUID_INIT_128(BT_UUID_CPF_VAL);
 
+/* 注意下标：cps_attrs[1] 必须是测量特征（notify 时按句柄取它） */
 static struct bt_gatt_attr cps_attrs[] = {
     BT_GATT_PRIMARY_SERVICE(&uuid_cps),
     BT_GATT_CHARACTERISTIC(&uuid_cpm.uuid,
@@ -256,6 +295,10 @@ static struct bt_gatt_attr cps_attrs[] = {
                            BT_GATT_PERM_READ,
                            read_measurement, NULL, measurement_buf),
     BT_GATT_CCC(ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(&uuid_cpf.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           read_feature, NULL, NULL),
 };
 
 static struct bt_gatt_service cps_svc = BT_GATT_SERVICE(cps_attrs);
@@ -414,7 +457,8 @@ static void start_discovery(struct bt_conn *conn)
     discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
     discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
     discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-    discover_params.uuid = &uuid_cps.uuid;
+    /* 这里找的是**功率计**的服务，实测它是 0x1828（并非标准的 0x1818） */
+    discover_params.uuid = &uuid_xds.uuid;
 
     int err = bt_gatt_discover(conn, &discover_params);
     if (err != 0)
@@ -528,7 +572,7 @@ static struct bt_conn_cb conn_callbacks = {
 };
 
 /* ------------------------------------------------------------------ */
-/* 扫描：找带 0x1828 服务的设备                                        */
+/* 扫描：找广播里带 0x1818 或 0x1828 的设备（功率计实测是后者）        */
 /* ------------------------------------------------------------------ */
 
 static bool adv_match(struct bt_data *data, void *user_data)
@@ -543,7 +587,9 @@ static bool adv_match(struct bt_data *data, void *user_data)
 
     for (size_t i = 0; (i + 1U) < data->data_len; i += 2U)
     {
-        if (sys_get_le16(&data->data[i]) == XDS_SERVICE_UUID16)
+        uint16_t const u = sys_get_le16(&data->data[i]);
+        /* 实测功率计广播的是 0x1828；为稳妥也接受标准的 0x1818 */
+        if ((u == XDS_ADV_UUID16) || (u == CPS_SERVICE_UUID16))
         {
             *found = true;
             return false;
@@ -580,7 +626,7 @@ static void log_seen_device(const struct bt_le_scan_recv_info *info, bool has_cp
     seen_count++;
 
     LOG_INF("扫描到 %s  rssi %d dBm  %s", bt_addr_le_str(info->addr),
-            info->rssi, has_cps ? "带 0x1828 <<<" : "无 0x1828");
+            info->rssi, has_cps ? "匹配功率计 <<<" : "不匹配");
 }
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
@@ -602,7 +648,7 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
         return;
     }
 
-    /* 关键：本机自己也广播 0x1828，不排除自己的地址就会「自己连自己」 */
+    /* 关键：本机自己也广播功率服务，不排除自己的地址就会「自己连自己」 */
     bt_addr_le_t own[CONFIG_BT_ID_MAX];
     size_t own_count = ARRAY_SIZE(own);
     bt_id_get(own, &own_count);
@@ -680,7 +726,7 @@ static void start_scan(void)
     {
         scan_running = true;
         SET_STATE(ST_SCANNING);
-        LOG_INF("开始扫描功率计（广播 0x1828 的设备）");
+        LOG_INF("开始扫描功率计（广播 0x1818/0x1828 的设备）");
     }
     else if (err == -EALREADY)
     {
@@ -695,14 +741,15 @@ static void start_scan(void)
 /* ------------------------------------------------------------------ */
 /* 广播参数与数据                                                      */
 /*   两个要点：                                                        */
-/*     1. 广播里必须带 0x1828 服务 UUID，码表按服务过滤才搜得到我们     */
+/*     1. 广播里必须带标准功率服务 0x1818，码表/app 按服务过滤才搜得到  */
 /*     2. 设备名放进**广播包**而不是扫描响应 —— 有些手机 app 只在       */
 /*        广播包里读名字，放在扫描响应里它会看不到这台设备              */
 /* ------------------------------------------------------------------ */
 
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(XDS_SERVICE_UUID16)),
+    /* 对外广播必须是标准功率服务 0x1818，手机/码表按它过滤 */
+    BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(CPS_SERVICE_UUID16)),
     BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, sizeof(DEVICE_NAME) - 1),
 };
 /* 共 3+4+17 = 24 字节，在 31 字节的 legacy 广播上限内，不需要扫描响应 */
@@ -746,7 +793,7 @@ int main(void)
         return err;
     }
 
-    /* 广播数据里必须带上 0x1828，否则码表按服务过滤时搜不到我们 */
+    /* 广播数据里必须带上 0x1818，否则手机/码表按服务过滤时搜不到我们 */
     err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
     if (err != 0)
     {
@@ -754,7 +801,7 @@ int main(void)
         SET_STATE(ST_ERROR);
         return err;
     }
-    LOG_INF("已开始广播「%s」，服务 0x1828 —— 码表/手机可搜索连接", DEVICE_NAME);
+    LOG_INF("已开始广播「%s」，服务 0x1818（标准功率服务）", DEVICE_NAME);
 
     /* 持续扫描功率计 */
     start_scan();
