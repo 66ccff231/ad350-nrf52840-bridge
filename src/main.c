@@ -553,9 +553,40 @@ static bool adv_match(struct bt_data *data, void *user_data)
 static void connect_work_handler(struct k_work *work);
 K_WORK_DEFINE(connect_work, connect_work_handler);
 
+/* 调试用：把扫描到的设备打出来，方便判断功率计到底有没有在广播。
+ * 用一张小表记住已打印过的地址，避免同一设备刷屏。 */
+#define SEEN_MAX 16
+static bt_addr_le_t seen_addrs[SEEN_MAX];
+static uint8_t seen_count;
+
+static void log_seen_device(const struct bt_le_scan_recv_info *info, bool has_cps)
+{
+    for (uint8_t i = 0U; i < seen_count; i++)
+    {
+        if (bt_addr_le_cmp(&info->addr, &seen_addrs[i]) == 0)
+        {
+            return;   /* 已经打过 */
+        }
+    }
+    if (seen_count >= SEEN_MAX)
+    {
+        seen_count = 0U;   /* 表满就重新开始记 */
+    }
+    seen_addrs[seen_count] = info->addr;
+    seen_count++;
+
+    LOG_INF("扫描到 %s  rssi %d dBm  %s", bt_addr_le_str(&info->addr),
+            info->rssi, has_cps ? "带 0x1828 <<<" : "无 0x1828");
+}
+
 static void scan_recv(const struct bt_le_scan_recv_info *info,
                       struct net_buf_simple *buf)
 {
+    /* 先解析并记录：不管后续是否要连接，都想知道现场有哪些设备 */
+    bool has_cps = false;
+    bt_data_parse(buf, adv_match, &has_cps);
+    log_seen_device(info, has_cps);
+
     if ((sensor_conn != NULL) || scan_connecting)
     {
         return;   /* 已连上或正在连 */
@@ -579,11 +610,9 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
         }
     }
 
-    bool found = false;
-    bt_data_parse(buf, adv_match, &found);
-    if (!found)
+    if (!has_cps)
     {
-        return;
+        return;   /* 不是功率计 */
     }
 
     LOG_INF("发现功率计 %s，停止扫描后连接", bt_addr_le_str(&info->addr));

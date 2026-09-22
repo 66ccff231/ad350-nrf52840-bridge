@@ -1,0 +1,25 @@
+/*
+ * ProMicro nRF52840 板级补充：把控制台/日志改到 USB CDC ACM
+ *
+ * 为什么要这个：
+ *   这块板子的 USB 由 nice!nano 类引导器提供，应用本身没有串口输出，
+ *   所以脱离电脑和串口工具就看不清固件在干什么。
+ *   板子的 DTS 里 `zephyr_udc0: &usbd { status = "okay"; }`，USB 设备控制器可用，
+ *   于是加一个 CDC ACM 虚拟串口，把 console 与日志都接到它上：
+ *   同一根 USB 线，既能供电/烧录，又能用串口工具看日志。
+ *
+ * 用法：插上 USB 后，设备管理器里会出现一个 COM 口（波特率随便填，CDC 不限速）。
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
