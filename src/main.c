@@ -332,6 +332,10 @@ static uint8_t notify_func(struct bt_conn *conn,
             m.total_power_w, m.cadence_rpm, m.left_power_w,
             m.right_power_w, m.angle_deg, m.error_code);
 
+    /* 同时打印原始字节：偏移 0-1 的「总功率」还没在真实负载下验证过，
+     * 有原始数据才能回头核对字段位置。 */
+    LOG_HEXDUMP_INF(data, length, "原始负载");
+
     k_work_submit(&notify_work);
     return BT_GATT_ITER_CONTINUE;
 }
