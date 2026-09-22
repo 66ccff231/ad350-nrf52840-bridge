@@ -60,8 +60,6 @@ jobs:
           cd ws
           echo "--- 与 promicro 相关的板子 ---"
           west boards | grep -i promicro || echo "(没找到 promicro 板)"
-          echo "--- 构建目标是否存在 ---"
-          west boards -b "${BOARD}" 2>&1 | head -5 || true
 
       - name: Build firmware
         run: |
