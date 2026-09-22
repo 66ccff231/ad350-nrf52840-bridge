@@ -24,6 +24,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -34,6 +35,85 @@
 #include "xds_protocol.h"
 
 LOG_MODULE_REGISTER(xds_bridge, LOG_LEVEL_INF);
+
+/* ------------------------------------------------------------------ */
+/* 状态指示灯（板载红色 LED，P0.15，高电平点亮）                       */
+/*   板子定义来自 Zephyr 的 boards/others/promicro_nrf52840：          */
+/*     led0: led_0 { gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>; }           */
+/*                                                                     */
+/*   为什么要这个：脱离电脑使用时看不到日志，LED 是唯一的状态反馈。      */
+/*     慢闪(1Hz)  正在扫描功率计                                        */
+/*     快闪        已发现功率计，正在连接                                */
+/*     常亮        已连上功率计，正在转发数据                            */
+/*     很慢的呼吸  启动中 / 出错                                        */
+/* ------------------------------------------------------------------ */
+
+#define LED_NODE DT_ALIAS(led0)
+static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
+
+enum bridge_state
+{
+    ST_BOOT = 0,
+    ST_SCANNING,
+    ST_CONNECTING,
+    ST_CONNECTED,
+    ST_ERROR,
+};
+
+static atomic_t bridge_state = ATOMIC_INIT(ST_BOOT);
+
+static void led_update(struct k_work *work)
+{
+    static uint32_t tick;
+    tick++;
+
+    int st = (int)atomic_get(&bridge_state);
+    bool on;
+
+    switch (st)
+    {
+    case ST_SCANNING:
+        on = ((tick % 10U) < 2U);          /* 100ms x10 = 1 秒一次慢闪 */
+        break;
+    case ST_CONNECTING:
+        on = ((tick % 2U) == 0U);          /* 5Hz 快闪 */
+        break;
+    case ST_CONNECTED:
+        on = true;                         /* 常亮 */
+        break;
+    case ST_ERROR:
+        on = ((tick % 4U) < 1U);           /* 急促短闪表示出错 */
+        break;
+    default:
+        on = ((tick % 30U) < 15U);         /* 启动中：很慢的呼吸 */
+        break;
+    }
+
+    (void)gpio_pin_set_dt(&status_led, on ? 1 : 0);
+}
+
+K_WORK_DEFINE(led_work, led_update);
+
+static void led_timer_handler(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+    k_work_submit(&led_work);
+}
+
+K_TIMER_DEFINE(led_timer, led_timer_handler, NULL);
+
+static void led_init(void)
+{
+    if (!gpio_is_ready_dt(&status_led))
+    {
+        LOG_WRN("状态 LED 未就绪，跳过");
+        return;
+    }
+    (void)gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+    k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));
+}
+
+#define SET_STATE(s) atomic_set(&bridge_state, (s))
 
 /* ------------------------------------------------------------------ */
 /* 配置                                                                */
@@ -359,9 +439,11 @@ static void sensor_connected(struct bt_conn *conn, uint8_t err)
         }
         scan_connecting = false;
         connect_retry_after_ms = k_uptime_get_32() + CONNECT_RETRY_BACKOFF_MS;
+        SET_STATE(ST_SCANNING);
         return;
     }
     scan_connecting = false;
+    SET_STATE(ST_CONNECTED);
     LOG_INF("已连接功率计");
     start_discovery(conn);
 }
@@ -384,6 +466,7 @@ static void sensor_disconnected(struct bt_conn *conn, uint8_t reason)
     }
     scan_connecting = false;
     connect_retry_after_ms = k_uptime_get_32() + CONNECT_RETRY_BACKOFF_MS;
+    SET_STATE(ST_SCANNING);
 }
 
 /* 码表连进来 */
@@ -504,6 +587,7 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
     }
 
     LOG_INF("发现功率计 %s，停止扫描后连接", bt_addr_le_str(&info->addr));
+    SET_STATE(ST_CONNECTING);
 
     /* 不能在这里直接停止扫描并连接：
      * scan_recv 跑在蓝牙接收线程上，就地调 bt_le_scan_stop() 有死锁风险，
@@ -559,6 +643,7 @@ static void start_scan(void)
     if (err == 0)
     {
         scan_running = true;
+        SET_STATE(ST_SCANNING);
         LOG_INF("开始扫描功率计（广播 0x1828 的设备）");
     }
     else if (err == -EALREADY)
@@ -573,17 +658,18 @@ static void start_scan(void)
 
 /* ------------------------------------------------------------------ */
 /* 广播参数与数据                                                      */
-/*   关键：广播里必须带 0x1828 服务 UUID，码表按服务过滤才搜得到我们。 */
+/*   两个要点：                                                        */
+/*     1. 广播里必须带 0x1828 服务 UUID，码表按服务过滤才搜得到我们     */
+/*     2. 设备名放进**广播包**而不是扫描响应 —— 有些手机 app 只在       */
+/*        广播包里读名字，放在扫描响应里它会看不到这台设备              */
 /* ------------------------------------------------------------------ */
 
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(XDS_SERVICE_UUID16)),
-};
-
-static const struct bt_data sd[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, sizeof(DEVICE_NAME) - 1),
 };
+/* 共 3+4+17 = 24 字节，在 31 字节的 legacy 广播上限内，不需要扫描响应 */
 
 static const struct bt_le_adv_param adv_param =
     BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONN,
@@ -601,11 +687,13 @@ int main(void)
 
     k_mutex_init(&state_lock);
     build_measurement(0);
+    led_init();                 /* 先点亮状态灯，方便肉眼判断板子有没有起来 */
 
     err = bt_enable(NULL);
     if (err != 0)
     {
         LOG_ERR("蓝牙初始化失败 (err %d)", err);
+        SET_STATE(ST_ERROR);
         return err;
     }
     LOG_INF("蓝牙已就绪");
@@ -618,14 +706,16 @@ int main(void)
     if (err != 0)
     {
         LOG_ERR("注册 CPS 服务失败 (err %d)", err);
+        SET_STATE(ST_ERROR);
         return err;
     }
 
     /* 广播数据里必须带上 0x1828，否则码表按服务过滤时搜不到我们 */
-    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
     if (err != 0)
     {
         LOG_ERR("启动广播失败 (err %d)", err);
+        SET_STATE(ST_ERROR);
         return err;
     }
     LOG_INF("已开始广播「%s」，服务 0x1828 —— 码表/手机可搜索连接", DEVICE_NAME);
