@@ -312,11 +312,6 @@ static void sensor_disconnected(struct bt_conn *conn, uint8_t reason)
     scan_connecting = false;
 }
 
-static struct bt_conn_cb conn_callbacks = {
-    .connected = connected_cb,
-    .disconnected = disconnected_cb,
-};
-
 /* 码表连进来 */
 static void client_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -365,6 +360,12 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
     }
 }
 
+/* 回调函数都已定义，这里再填内容 */
+static struct bt_conn_cb conn_callbacks = {
+    .connected = connected_cb,
+    .disconnected = disconnected_cb,
+};
+
 /* ------------------------------------------------------------------ */
 /* 扫描：找带 0x1828 服务的设备                                        */
 /* ------------------------------------------------------------------ */
@@ -390,6 +391,11 @@ static bool adv_match(struct bt_data *data, void *user_data)
     return true;
 }
 
+/* 连接工作项：scan_recv 里要用到它，所以先声明并定义；
+ * 处理函数本体写在 scan_recv 之后。 */
+static void connect_work_handler(struct k_work *work);
+K_WORK_DEFINE(connect_work, connect_work_handler);
+
 static void scan_recv(const struct bt_le_scan_recv_info *info,
                       struct net_buf_simple *buf)
 {
@@ -407,22 +413,33 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 
     LOG_INF("发现功率计 %s，停止扫描后连接", bt_addr_le_str(&info->addr));
 
-    /* 先记下目标地址，等扫描真正停止的回调里再发起连接 ——
-     * 直接在这里调 bt_conn_le_create 会撞上 "扫描仍活动" 而返回 -EAGAIN。 */
+    /* 不能在这里直接停止扫描并连接：
+     * scan_recv 跑在蓝牙接收线程上，就地调 bt_le_scan_stop() 有死锁风险，
+     * 而且扫描未真正停止时 bt_conn_le_create() 会返回 -EAGAIN。
+     * 所以丢给系统工作队列去做。 */
     memcpy(&pending_addr, &info->addr, sizeof(pending_addr));
     scan_connecting = true;
-    bt_le_scan_stop();
+    k_work_submit(&connect_work);
 }
 
-static void scan_stopped_cb(void)
+/* 在系统工作队列里：先停扫描，再发起连接 */
+static void connect_work_handler(struct k_work *work)
 {
+    ARG_UNUSED(work);
+
     if (!scan_connecting)
     {
         return;
     }
 
-    int err = bt_conn_le_create(&pending_addr, BT_CONN_LE_CREATE_CONN,
-                                BT_LE_CONN_PARAM_DEFAULT, &sensor_conn);
+    int err = bt_le_scan_stop();
+    if ((err != 0) && (err != -EALREADY))
+    {
+        LOG_WRN("停止扫描失败 (err %d)", err);
+    }
+
+    err = bt_conn_le_create(&pending_addr, BT_CONN_LE_CREATE_CONN,
+                            BT_LE_CONN_PARAM_DEFAULT, &sensor_conn);
     if (err != 0)
     {
         LOG_ERR("发起连接失败 (err %d)", err);
@@ -431,10 +448,10 @@ static void scan_stopped_cb(void)
     }
 }
 
+/* 注意：Zephyr 4.1 的 bt_le_scan_cb 只有 recv / timeout，没有 stopped 成员，
+ * 所以「停扫描后再连接」改用上面的工作队列实现。 */
 static struct bt_le_scan_cb scan_callbacks = {
     .recv = scan_recv,
-    .timeout = NULL,
-    .stopped = scan_stopped_cb,
 };
 
 /* ------------------------------------------------------------------ */
