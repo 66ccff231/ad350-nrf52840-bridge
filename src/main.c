@@ -54,6 +54,9 @@ LOG_MODULE_REGISTER(xds_bridge, LOG_LEVEL_INF);
 /** 数据超时：超过这么久没收到测量就认为掉线 */
 #define DATA_TIMEOUT_MS 10000
 
+/** 连接失败后的退避时间：避免每秒猛试，把连接对象和射频都耗掉 */
+#define CONNECT_RETRY_BACKOFF_MS 5000
+
 /* ------------------------------------------------------------------ */
 /* 共享状态                                                            */
 /* ------------------------------------------------------------------ */
@@ -73,6 +76,7 @@ static bool scan_connecting;           /* 是否正在「停扫描 -> 发起连�
 static bool scan_running;              /* 我们自己记录扫描状态。
                                         * Zephyr 4.1 没有公开的
                                         * bt_le_scan_is_started()，所以自己记。 */
+static uint32_t connect_retry_after_ms; /* 连接失败后的退避截止时刻 */
 
 /* ------------------------------------------------------------------ */
 /* 标准 Cycling Power Measurement 负载构造                             */
@@ -344,7 +348,17 @@ static void sensor_connected(struct bt_conn *conn, uint8_t err)
     if (err != 0)
     {
         LOG_ERR("连接功率计失败 (err %u)", err);
+
+        /* 连接失败时本回调也会被调用，此时必须释放 bt_conn_le_create()
+         * 给出的引用 —— 否则每失败一次漏一个连接对象，
+         * CONFIG_BT_MAX_CONN 耗尽后整个蓝牙栈就废了（实测就是这样停摆的）。 */
+        if (sensor_conn != NULL)
+        {
+            bt_conn_unref(sensor_conn);
+            sensor_conn = NULL;
+        }
         scan_connecting = false;
+        connect_retry_after_ms = k_uptime_get_32() + CONNECT_RETRY_BACKOFF_MS;
         return;
     }
     scan_connecting = false;
@@ -362,9 +376,14 @@ static void sensor_disconnected(struct bt_conn *conn, uint8_t reason)
     latest = (xds_power_measurement_t){0};
     k_mutex_unlock(&state_lock);
 
-    bt_conn_unref(sensor_conn);
-    sensor_conn = NULL;
+    /* 判空：失败路径上可能已经被清掉了 */
+    if (sensor_conn != NULL)
+    {
+        bt_conn_unref(sensor_conn);
+        sensor_conn = NULL;
+    }
     scan_connecting = false;
+    connect_retry_after_ms = k_uptime_get_32() + CONNECT_RETRY_BACKOFF_MS;
 }
 
 /* 码表连进来 */
@@ -457,6 +476,24 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
     if ((sensor_conn != NULL) || scan_connecting)
     {
         return;   /* 已连上或正在连 */
+    }
+
+    /* 连接失败后先退避，别一秒一次猛试 */
+    if (k_uptime_get_32() < connect_retry_after_ms)
+    {
+        return;
+    }
+
+    /* 关键：本机自己也广播 0x1828，不排除自己的地址就会「自己连自己」 */
+    bt_addr_le_t own[CONFIG_BT_ID_MAX];
+    size_t own_count = ARRAY_SIZE(own);
+    bt_id_get(own, &own_count);
+    for (size_t i = 0U; i < own_count; i++)
+    {
+        if (bt_addr_le_cmp(&info->addr, &own[i]) == 0)
+        {
+            return;   /* 这是自己 */
+        }
     }
 
     bool found = false;
