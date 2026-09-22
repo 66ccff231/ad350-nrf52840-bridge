@@ -8,13 +8,10 @@ twister-out/
 *.elf
 *.map
 
-# west 工作区
-.west/
-modules/
-zephyr/
-nrf/
-bootloader/
-tools/
+# west 工作区的同级目录只在本仓库被当作工作区根时才存在；
+# 本仓库是「应用仓库」（west 清单里 self.path = app），
+# 这些目录不在仓库内，不需要忽略 —— 尤其不要写 tools/，
+# 否则会把自己仓库里的 tools/ 调试脚本一起挡掉（踩过这个坑）。
 
 # 编辑器 / 系统
 .vscode/
@@ -25,4 +22,3 @@ tools/
 # Python 辅助脚本产生的临时文件
 __pycache__/
 *.pyc
-_selfcheck.txt
