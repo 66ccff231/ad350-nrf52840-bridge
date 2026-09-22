@@ -1,0 +1,28 @@
+# Zephyr / west 构建产物
+build/
+build_*/
+twister-out/
+*.uf2
+*.hex
+*.bin
+*.elf
+*.map
+
+# west 工作区
+.west/
+modules/
+zephyr/
+nrf/
+bootloader/
+tools/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python 辅助脚本产生的临时文件
+__pycache__/
+*.pyc
+_selfcheck.txt

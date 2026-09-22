@@ -1,0 +1,58 @@
+# 在 GitHub 上自动编译固件 —— 不需要你本地安装 nRF Connect SDK（约 10 GB）
+#
+# 用法：
+#   1. 把整个 xds-nrf52840-bridge 目录推到你自己的 GitHub 仓库
+#   2. 推送后 GitHub Actions 自动开始构建
+#   3. 构建完在 Actions 页面下载 artifacts 里的 zephyr.uf2
+#   4. 按住开发板复位键进入 bootloader，把 uf2 拖进弹出的 U 盘
+#
+# 如果目标板名不对（第三步报 "board not found"），改下面的 -b 参数。
+# 常见可选：promicro_nrf52840/nrf52840/uf2 ／ nrf52840dk_nrf52840
+#           nice_nano_v2 ／ nrf52840dongle_nrf52840
+
+name: Build nRF52840 firmware
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/zephyrproject-rtos/zephyr-build:v0.28.5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: Init west workspace
+        shell: bash
+        run: |
+          set -e
+          west init -l app
+          west update --narrow -o=--depth=1
+
+      - name: Build
+        shell: bash
+        working-directory: app
+        run: |
+          set -e
+          west build -b promicro_nrf52840/nrf52840/uf2 . --pristine
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: xds-bridge-uf2
+          path: |
+            app/build/zephyr/zephyr.uf2
+            app/build/zephyr/zephyr.hex
+          if-no-files-found: warn
+
+      - name: Upload build log if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: app/build/ 2>/dev/null || true
+          if-no-files-found: ignore
