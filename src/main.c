@@ -70,6 +70,9 @@ static atomic_t ccc_enabled = ATOMIC_INIT(0);
 
 static bt_addr_le_t pending_addr;      /* 待连接的功率计地址 */
 static bool scan_connecting;           /* 是否正在「停扫描 -> 发起连接」流程中 */
+static bool scan_running;              /* 我们自己记录扫描状态。
+                                        * Zephyr 4.1 没有公开的
+                                        * bt_le_scan_is_started()，所以自己记。 */
 
 /* ------------------------------------------------------------------ */
 /* 标准 Cycling Power Measurement 负载构造                             */
@@ -437,6 +440,7 @@ static void connect_work_handler(struct k_work *work)
     {
         LOG_WRN("停止扫描失败 (err %d)", err);
     }
+    scan_running = false;
 
     err = bt_conn_le_create(&pending_addr, BT_CONN_LE_CREATE_CONN,
                             BT_LE_CONN_PARAM_DEFAULT, &sensor_conn);
@@ -453,6 +457,30 @@ static void connect_work_handler(struct k_work *work)
 static struct bt_le_scan_cb scan_callbacks = {
     .recv = scan_recv,
 };
+
+/** @brief 开始扫描功率计，并记录状态（Zephyr 没有公开的「是否在扫描」查询接口） */
+static void start_scan(void)
+{
+    if (scan_running)
+    {
+        return;
+    }
+
+    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
+    if (err == 0)
+    {
+        scan_running = true;
+        LOG_INF("开始扫描功率计（广播 0x1828 的设备）");
+    }
+    else if (err == -EALREADY)
+    {
+        scan_running = true;   /* 已经在扫了 */
+    }
+    else
+    {
+        LOG_ERR("启动扫描失败 (err %d)", err);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* 广播参数与数据                                                      */
@@ -514,11 +542,7 @@ int main(void)
     LOG_INF("已开始广播「%s」，服务 0x1828 —— 码表/手机可搜索连接", DEVICE_NAME);
 
     /* 持续扫描功率计 */
-    err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
-    if (err != 0)
-    {
-        LOG_ERR("启动扫描失败 (err %d)", err);
-    }
+    start_scan();
 
     while (1)
     {
@@ -535,9 +559,10 @@ int main(void)
             bt_conn_disconnect(sensor_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         }
 
-        if ((sensor_conn == NULL) && !bt_le_scan_is_started())
+        /* 没在扫描也没连上，就重新开始找功率计 */
+        if ((sensor_conn == NULL) && !scan_running && !scan_connecting)
         {
-            bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
+            start_scan();
         }
 
         /* 没数据时也定期推 0，让码表知道桥还活着 */
