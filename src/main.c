@@ -572,6 +572,27 @@ static struct bt_conn_cb conn_callbacks = {
 };
 
 /* ------------------------------------------------------------------ */
+/* 配对状态日志：手机/码表来配对时能看到究竟发生了什么                 */
+/* ------------------------------------------------------------------ */
+
+static void pairing_complete_cb(struct bt_conn *conn, bool bonded)
+{
+    ARG_UNUSED(conn);
+    LOG_INF("配对完成（bonded=%d）", bonded);
+}
+
+static void pairing_failed_cb(struct bt_conn *conn, enum bt_security_err reason)
+{
+    ARG_UNUSED(conn);
+    LOG_WRN("配对失败（reason=%d）", reason);
+}
+
+static struct bt_conn_auth_info_cb auth_info_callbacks = {
+    .pairing_complete = pairing_complete_cb,
+    .pairing_failed = pairing_failed_cb,
+};
+
+/* ------------------------------------------------------------------ */
 /* 扫描：找广播里带 0x1818 或 0x1828 的设备（功率计实测是后者）        */
 /* ------------------------------------------------------------------ */
 
@@ -782,6 +803,7 @@ int main(void)
     LOG_INF("蓝牙已就绪");
 
     bt_conn_cb_register(&conn_callbacks);
+    bt_conn_auth_info_cb_register(&auth_info_callbacks);
     bt_le_scan_cb_register(&scan_callbacks);
 
     /* 注册标准 CPS 服务，并开始广播 */
