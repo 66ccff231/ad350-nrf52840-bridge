@@ -76,17 +76,64 @@ static bool scan_running;              /* 我们自己记录扫描状态。
 
 /* ------------------------------------------------------------------ */
 /* 标准 Cycling Power Measurement 负载构造                             */
-/*   flags(u16) = 0x0000 表示只带必选的 instantaneous power（s16）      */
-/*   这是兼容性最好的最简形式，码表与手机都能解析                        */
+/*   flags bit5 (0x0020) = 带曲柄数据：累计圈数(u16) + 上次曲柄事件时间   */
+/*   事件时间单位 1/1024 秒，16 位回绕（每 64 秒一圈）                   */
+/*                                                                     */
+/*   为什么要带曲柄数据：功率计只给瞬时踏频，不带圈数。而空转（无负载）   */
+/*   时功率必然为 0，只有曲柄圈数会动 —— 有了它才能区分                  */
+/*   「已连上但没负载」和「压根没连上」，验证和排错都靠它。              */
 /* ------------------------------------------------------------------ */
 
-static uint8_t measurement_buf[4];
+#define CPS_FLAG_CRANK  0x0020U
+
+static uint8_t measurement_buf[8];
+
+static uint16_t crank_revs;        /* 累计曲柄圈数 */
+static uint16_t crank_evt_time;    /* 上次曲柄事件时间，1/1024 秒 */
+static uint32_t crank_last_ms;     /* 上次更新的时刻 */
+static uint32_t crank_frac_mrev;   /* 未满一圈的千分比余数，避免整数截断丢圈 */
+
+static void update_crank(uint16_t cadence_rpm)
+{
+    uint32_t now = k_uptime_get_32();
+
+    if (crank_last_ms == 0U)
+    {
+        crank_last_ms = now;
+        return;
+    }
+
+    uint32_t dt = now - crank_last_ms;
+    crank_last_ms = now;
+    if (dt == 0U)
+    {
+        return;
+    }
+
+    /* 时间戳始终推进（即使没踏频），符合 CPS 对事件时间的定义 */
+    crank_evt_time = (uint16_t)(crank_evt_time + ((dt * 1024U) / 1000U));
+
+    if (cadence_rpm == 0U)
+    {
+        return;   /* 没踩就不加圈数 */
+    }
+
+    /* 圈数增量 = rpm * dt(ms) / 60000，用千分之一圈定点累计避免丢圈 */
+    crank_frac_mrev += ((uint32_t)cadence_rpm * dt * 1000U) / 60000U;
+    while (crank_frac_mrev >= 1000U)
+    {
+        crank_frac_mrev -= 1000U;
+        crank_revs++;
+    }
+}
 
 static void build_measurement(uint16_t power_w)
 {
     int16_t p = (int16_t)MIN(power_w, (uint16_t)INT16_MAX);
-    sys_put_le16(0x0000U, &measurement_buf[0]);                 /* flags */
-    sys_put_le16((uint16_t)p, &measurement_buf[2]);             /* power */
+    sys_put_le16(CPS_FLAG_CRANK, &measurement_buf[0]);          /* flags */
+    sys_put_le16((uint16_t)p, &measurement_buf[2]);             /* 瞬时功率 */
+    sys_put_le16(crank_revs, &measurement_buf[4]);              /* 累计圈数 */
+    sys_put_le16(crank_evt_time, &measurement_buf[6]);          /* 事件时间 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -143,12 +190,17 @@ static void notify_work_handler(struct k_work *work)
     }
 
     uint16_t power = 0;
+    uint16_t cadence = 0;
     bool fresh;
 
     k_mutex_lock(&state_lock, K_FOREVER);
     power = latest.total_power_w;
+    cadence = latest.cadence_rpm;
     fresh = have_data && ((k_uptime_get_32() - last_rx_ms) < DATA_TIMEOUT_MS);
     k_mutex_unlock(&state_lock);
+
+    /* 曲柄圈数要一直积分（即使功率为 0），否则空转时圈数不动就没法判断链路 */
+    update_crank(fresh ? cadence : 0U);
 
     build_measurement(fresh ? power : 0U);
 
