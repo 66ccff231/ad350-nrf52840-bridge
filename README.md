@@ -53,8 +53,10 @@
 02 00 01 00 01 00 18 00 …   → 总 2 W，左 1，右 1
 ```
 
-字段定义与 [上游参考实现](https://github.com/DuoDuoJuZi/xds_forwarding)
-的 `xds_protocol.c` 一致。若换用其他型号发现字段不符，只需改 `src/xds_protocol.c`。
+协议字段偏移最初是从 [另一个开源实现](https://github.com/DuoDuoJuZi/xds_forwarding)
+得知的（该仓库未声明许可证）。**当前 `src/meter_protocol.c/h` 已按协议事实独立重写**
+——采用顺序读游标的实现方式，与它没有代码复用，仅在此致谢来源。
+若换用其他型号发现字段不符，只需改 `src/meter_protocol.h` 里的偏移表。
 
 ### 两个容易踩的坑（实测确认）
 
@@ -65,8 +67,8 @@
    这两个 UUID 用途不同，不能混。
 
 2. **不需要向 `0x2A55` 发启动命令**
-   上游参考实现会写 `02 16 AA 10` 到控制点，但实测本设备返回 `0x81` 拒绝，
-   且不发送也能正常收到测量数据，因此本固件不实现这一步。
+   另一个开源实现会写 `02 16 AA 10` 到控制点，但实测本设备返回 `0x81` 拒绝，
+   且不发送也能正常收到测量数据，因此本固件不实现这一步（代码里那个未使用的 UUID 宏也已删除）。
 
 ---
 
@@ -76,7 +78,7 @@
 
 1. 把本仓库推送到 GitHub
 2. 推送后 Actions 自动构建
-3. 在 Actions 页面下载 artifacts 里的 `xds-bridge-uf2`
+3. 在 Actions 页面下载 artifacts 里的 `power-bridge-uf2`
 4. 得到 `zephyr.uf2`
 
 构建使用 mainline Zephyr `v4.1.0` 与 `boards/others/promicro_nrf52840` 的
@@ -222,7 +224,7 @@ flags = 0x0020 (bit5 = 带曲柄数据)
 | `read_log_auto.py` | **最常用**。自动找到板子的串口并显示固件日志（波特率随意，CDC 不限速） |
 | `check_bridge_adv.py` | 扫描并打印板子广播的服务 UUID 与名称，确认广播是否正确 |
 | `test_bridge2.py` | 电脑扮演码表连上桥，读取转发的功率数据 |
-| `xds_capture.py` | 直连功率计抓原始通知（绕过桥），用于核对协议 |
+| `meter_capture.py` | 直连功率计抓原始通知（绕过桥），用于核对协议 |
 | `check_notify_rate.py` | **测功率计上报频率**，判定「角度法数真实圈数」可不可行（结论见上一节）。跑之前要拔掉桥接板子 |
 
 日志里的关键行：
@@ -242,11 +244,25 @@ flags = 0x0020 (bit5 = 带曲柄数据)
 
 | 文件 | 说明 |
 |---|---|
-| `src/main.c` | 主逻辑：Central 连功率计 + Peripheral 冒充功率计（广播名在此定义） |
-| `src/xds_protocol.c/h` | 私有协议解析（字段偏移已实测验证） |
+| `src/main.c` | 主逻辑：Central 连功率计 + Peripheral 对外冒充功率计（广播名在此定义） |
+| `src/meter_protocol.c/h` | 私有协议解析（按协议事实独立实现；字段偏移已实测验证） |
 | `prj.conf` | Zephyr 配置（BLE 双角色、SMP、USB CDC 控制台、状态灯） |
 | `west.yml` | Zephyr 清单，固定 `v4.1.0` |
 | `promicro_nrf52840_nrf52840_uf2.overlay` | 板级补充：USB CDC ACM 作 console |
 | `CMakeLists.txt` | 构建入口 |
+| `LICENSE` | MIT |
 | `.github/workflows/build.yml` | 云端编译 |
 | `tools/` | 调试与验证脚本（见上） |
+
+---
+
+## 许可证与声明
+
+- **本仓库代码：MIT**，见 `LICENSE`。
+- 编译产物 `zephyr.uf2` 内**包含 Zephyr RTOS**（Apache-2.0）。分发固件时请一并
+  遵守 Zephyr 的许可条款。
+- 本项目与任何功率计厂商**没有关联，也未获其授权或背书**。文中出现的厂商与型号
+  名称仅用于**说明兼容性**（描述性使用），不表示任何官方关系；对外广播的设备名
+  刻意只使用描述性词汇。
+- 协议字段是通过**观察设备自身的 BLE 通知**得到的（为互操作性所做的逆向分析），
+  没有绕过任何技术保护措施。

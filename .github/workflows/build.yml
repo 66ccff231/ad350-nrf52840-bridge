@@ -18,7 +18,7 @@ on:
 env:
   BOARD: promicro_nrf52840/nrf52840/uf2
   ZEPHYR_SDK_VERSION: 0.17.0
-  APP_REPO: https://github.com/66ccff231/xds-nrf52840-bridge.git
+  APP_REPO: https://github.com/66ccff231/nrf52840-bridge.git
 
 jobs:
   build:
@@ -75,7 +75,7 @@ jobs:
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: xds-bridge-uf2
+          name: power-bridge-uf2
           path: |
             ws/app/build/zephyr/zephyr.uf2
             ws/app/build/zephyr/zephyr.hex

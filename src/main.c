@@ -1,17 +1,17 @@
 /*
- * XDS 功率计 → 标准 BLE 功率计 桥接固件
- * ======================================
+ * 功率计 → 标准 BLE 功率计 桥接固件
+ * ==================================
  *
  * 数据流：
- *   XDS 功率计 --BLE 0x2A63--> 本机（Central） --BLE 0x1818 CPS--> 手机 app / 码表
+ *   功率计 --BLE 0x2A63--> 本机（Central） --BLE 0x1818 CPS--> 手机 app / 码表
  *
  * 本机同时扮演两个角色：
- *   1. Central：扫描并连接 XDS 功率计，订阅 0x2A63 拿测量数据
+ *   1. Central：扫描并连接功率计，订阅 0x2A63 拿测量数据
  *   2. Peripheral：以标准 Cycling Power 服务（0x1818）广播，供手机/码表连接
  *
  * 注意两个 UUID 用途不同，别混：
  *   - 对外广播/提供：0x1818（标准自行车功率服务）
- *   - 扫描功率计用：0x1828（实测 XDS 功率计自己用的非标准 UUID，
+ *   - 扫描功率计用：0x1828（型号实测用的非标准 UUID，
  *                      按标准它其实是 Mesh Proxy）
  *
  * 为什么不做 ANT+：
@@ -39,9 +39,9 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/logging/log.h>
 
-#include "xds_protocol.h"
+#include "meter_protocol.h"
 
-LOG_MODULE_REGISTER(xds_bridge, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(ble_power_bridge, LOG_LEVEL_INF);
 
 /* ------------------------------------------------------------------ */
 /* 状态指示灯（板载红色 LED，P0.15，高电平点亮）                       */
@@ -132,7 +132,7 @@ static void led_init(void)
 /* ⚠️ 这里有两个不同的 UUID，别搞混：                                    */
 /*   CPS_SERVICE_UUID16 = 0x1818 是**标准自行车功率服务**，             */
 /*                        我们自己广播/提供的必须是它（手机/码表认它）  */
-/*   XDS_ADV_UUID16     = 0x1828 是实测中 XDS 功率计广播里带的 UUID    */
+/*   METER_ADV_UUID16   = 0x1828 是实测中功率计广播里带的 UUID          */
 /*                        （它按道理该用 0x1818，但实测就是 0x1828），  */
 /*                        扫描时用它来认功率计                          */
 /*                                                                     */
@@ -147,21 +147,18 @@ static void led_init(void)
  *  很多运动 app 按这个字段筛选功率计，不广播就可能搜不到。 */
 #define CPS_APPEARANCE          0x0484
 /** Cycling Power Sensor Location 特征的值：5 = Left Crank。
- *  XDS 这台是曲柄功率计，报「左曲柄」最贴切。 */
+ *  这台是曲柄功率计，报「左曲柄」最贴切。 */
 #define CPS_SENSOR_LOCATION     0x05
-/** 实测 XDS 功率计广播里出现的 UUID，用于扫描匹配 */
-#define XDS_ADV_UUID16          0x1828
+/** 实测功率计广播里出现的 UUID，用于扫描匹配 */
+#define METER_ADV_UUID16        0x1828
 /** Cycling Power Measurement：功率数据在这里 */
-#define XDS_MEAS_CHAR_UUID16    0x2A63
+#define METER_MEAS_CHAR_UUID16  0x2A63
 /** Cycling Power Feature：部分 app 连接后会读它 */
 #define CPS_FEATURE_CHAR_UUID16 0x2A65
-/** Cycling Power Control Point（0x2A66）。xds_forwarding 会写启动命令
- *  {02 16 AA 10}，实测本设备返回 0x81 拒绝，且不发也能收到测量数据，
- *  所以本固件不实现这一步；若日后需要，见 README「已知未完成项」。 */
-#define XDS_CTRL_CHAR_UUID16    0x2A55
 
-/** 本机广播名（码表/手机会看到这个名字） */
-#define DEVICE_NAME "XDS Power Bridge"
+/** 本机广播名（码表/手机会看到这个名字）。
+ *  刻意只用描述性词汇，不含任何厂商商标。 */
+#define DEVICE_NAME "Power Meter Bridge"
 
 /** 数据超时：超过这么久没收到测量就认为掉线 */
 #define DATA_TIMEOUT_MS 10000
@@ -174,12 +171,12 @@ static void led_init(void)
 /* ------------------------------------------------------------------ */
 
 static struct k_mutex state_lock;
-static xds_power_measurement_t latest;
+static meter_frame_t latest;
 static uint32_t last_rx_ms;
 static bool have_data;
 static atomic_t notify_pending = ATOMIC_INIT(0);
 
-static struct bt_conn *sensor_conn;    /* 到 XDS 功率计的连接 */
+static struct bt_conn *sensor_conn;    /* 到功率计的连接 */
 static struct bt_conn *client_conn;    /* 码表连进来的连接 */
 static atomic_t ccc_enabled = ATOMIC_INIT(0);
 
@@ -292,7 +289,7 @@ static void build_measurement(uint16_t power_w)
 /* ------------------------------------------------------------------ */
 /* GATT 服务：标准 Cycling Power（0x1818）                             */
 /*   我们对外提供的服务必须是标准 0x1818 —— 手机/码表按它过滤。         */
-/*   功率计自己用的 0x1828 只用于我们做 Central 时去发现它（见 uuid_xds）*/
+/*   功率计自己用的 0x1828 只用于我们做 Central 时去发现它（见 uuid_meter）*/
 /* ------------------------------------------------------------------ */
 
 static ssize_t read_measurement(struct bt_conn *conn,
@@ -336,7 +333,7 @@ static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  * 注意 0x1818（我们的服务）与 0x1828（功率计的服务）是两个不同的东西。 */
 #define BT_UUID_CPS_VAL \
     BT_UUID_128_ENCODE(0x00001818, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
-#define BT_UUID_XDS_VAL \
+#define BT_UUID_METER_VAL \
     BT_UUID_128_ENCODE(0x00001828, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 #define BT_UUID_CPM_VAL \
     BT_UUID_128_ENCODE(0x00002a63, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
@@ -346,7 +343,7 @@ static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
     BT_UUID_128_ENCODE(0x00002a5b, 0x0000, 0x1000, 0x8000, 0x00805f9b34fb)
 
 static struct bt_uuid_128 uuid_cps = BT_UUID_INIT_128(BT_UUID_CPS_VAL);
-static struct bt_uuid_128 uuid_xds = BT_UUID_INIT_128(BT_UUID_XDS_VAL);
+static struct bt_uuid_128 uuid_meter = BT_UUID_INIT_128(BT_UUID_METER_VAL);
 static struct bt_uuid_128 uuid_cpm = BT_UUID_INIT_128(BT_UUID_CPM_VAL);
 static struct bt_uuid_128 uuid_cpf = BT_UUID_INIT_128(BT_UUID_CPF_VAL);
 static struct bt_uuid_128 uuid_cpl = BT_UUID_INIT_128(BT_UUID_CPL_VAL);
@@ -389,8 +386,8 @@ static void notify_work_handler(struct k_work *work)
     bool fresh;
 
     k_mutex_lock(&state_lock, K_FOREVER);
-    power = latest.total_power_w;
-    cadence = latest.cadence_rpm;
+    power = latest.total_w;
+    cadence = latest.rpm;
     fresh = have_data && ((k_uptime_get_32() - last_rx_ms) < DATA_TIMEOUT_MS);
     k_mutex_unlock(&state_lock);
 
@@ -426,8 +423,8 @@ static uint8_t notify_func(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
-    xds_power_measurement_t m;
-    if (!xds_power_measurement_parse((uint8_t const *)data, length, &m))
+    meter_frame_t m;
+    if (!meter_frame_parse((uint8_t const *)data, length, &m))
     {
         LOG_WRN("忽略过短的测量（%u 字节）", (unsigned int)length);
         return BT_GATT_ITER_CONTINUE;
@@ -440,8 +437,8 @@ static uint8_t notify_func(struct bt_conn *conn,
     k_mutex_unlock(&state_lock);
 
     LOG_INF("收到 总功率=%u W 踏频=%u rpm 左=%d 右=%d 角度=%d err=%u",
-            m.total_power_w, m.cadence_rpm, m.left_power_w,
-            m.right_power_w, m.angle_deg, m.error_code);
+            m.total_w, m.rpm, m.left_w,
+            m.right_w, m.crank_angle, m.fault);
 
     /* 同时打印原始字节。偏移 0-1 的「总功率」已在真实骑行负载下验证
      * （Wahoo 与官方 app 平均 63 W / 峰值 232 W 一致），留着他日核对字段。 */
@@ -526,7 +523,7 @@ static void start_discovery(struct bt_conn *conn)
     discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
     discover_params.type = BT_GATT_DISCOVER_PRIMARY;
     /* 这里找的是**功率计**的服务，实测它是 0x1828（并非标准的 0x1818） */
-    discover_params.uuid = &uuid_xds.uuid;
+    discover_params.uuid = &uuid_meter.uuid;
 
     int err = bt_gatt_discover(conn, &discover_params);
     if (err != 0)
@@ -571,7 +568,7 @@ static void sensor_disconnected(struct bt_conn *conn, uint8_t reason)
 
     k_mutex_lock(&state_lock, K_FOREVER);
     have_data = false;
-    latest = (xds_power_measurement_t){0};
+    latest = (meter_frame_t){0};
     k_mutex_unlock(&state_lock);
 
     /* 判空：失败路径上可能已经被清掉了 */
@@ -689,7 +686,7 @@ static bool adv_match(struct bt_data *data, void *user_data)
     {
         uint16_t const u = sys_get_le16(&data->data[i]);
         /* 实测功率计广播的是 0x1828；为稳妥也接受标准的 0x1818 */
-        if ((u == XDS_ADV_UUID16) || (u == CPS_SERVICE_UUID16))
+        if ((u == METER_ADV_UUID16) || (u == CPS_SERVICE_UUID16))
         {
             *found = true;
             return false;

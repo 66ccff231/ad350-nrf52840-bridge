@@ -35,8 +35,8 @@
 注意事项
 --------
   - 跑之前**断开桥接板子**：功率计同时只允许一个连接，板子占着就连不上。
-  - 本脚本按 `0x1828` 服务认功率计；桥自己广播 `0x1818` 且名字叫
-    「XDS Power Bridge」，所以名字里含 xds 但带 bridge 的一律排除，免得抓到自己人。
+  - 认功率计优先看 `0x1828` 服务；有些型号广播里不带服务 UUID，才退回按名字认。
+    我们自己的桥广播 `0x1818` 且名字含 bridge，一律排除，免得抓到自己人。
   - 输出 CSV：t, dt_ms, total_w, left_w, right_w, cadence, angle, err, len, raw_hex
 
 需要：pip install bleak
@@ -53,11 +53,17 @@ import time
 from bleak import BleakClient, BleakScanner
 
 BASE = "0000{}-0000-1000-8000-00805f9b34fb"
-UUID_XDS_SERVICE = BASE.format("1828")   # the METER advertises this
-UUID_CP_SERVICE = BASE.format("1818")    # our own bridge advertises this
+UUID_METER_SERVICE = BASE.format("1828")   # 功率计广播的服务（非标准，实测如此）
+UUID_CP_SERVICE = BASE.format("1818")      # 我们自己的桥广播这个
 UUID_CP_MEAS = BASE.format("2a63")
 UUID_CP_CTRL = BASE.format("2a55")
-XDS_START_COMMAND = bytes([0x02, 0x16, 0xAA, 0x10])
+METER_START_COMMAND = bytes([0x02, 0x16, 0xAA, 0x10])
+
+# 我们自己的桥的广播名，用于在扫描时把自己排除掉
+BRIDGE_NAME = "Power Meter Bridge"
+# 功率计广播名里的厂商片段（由厂商烧进设备，实测型号形如 XDS-A001-xxxx）。
+# 仅在没有服务 UUID 时用来兜底识别。
+METER_NAME_HINT = "xds-"
 
 DEFAULT_ADDRESS = "C0:A1:25:04:32:08"
 
@@ -107,12 +113,12 @@ async def scan_devices(verbose=True):
         if verbose:
             print("  %-34s %-24s rssi=%s uuids=%s"
                   % (dev.address, name or "(none)", rssi, ",".join(uuids) or "-"))
-        # The meter is the device advertising 0x1828. Our own bridge advertises
-        # 0x1818 and is literally named "XDS Power Bridge", so a name match on
-        # "xds" alone would pick up the bridge instead of the meter.
-        hit = UUID_XDS_SERVICE in uuids
-        if not hit and "xds" in name.lower() and "bridge" not in name.lower():
-            hit = True
+        low = name.lower()
+        # 功率计 = 广播 0x1828 的那个；有些型号不带服务 UUID，退回按名字认。
+        hit = (UUID_METER_SERVICE in uuids) or (METER_NAME_HINT in low)
+        # 排除我们自己的桥：它广播 0x1818，名字里含 bridge。
+        if (UUID_CP_SERVICE in uuids) or (low == BRIDGE_NAME.lower()) or ("bridge" in low):
+            hit = False
         if hit:
             cands.append(dev)
     return cands
@@ -300,7 +306,7 @@ async def main():
         return
     if not cands:
         print()
-        print("no candidate found (service 0x1828 / name XDS).")
+        print("no candidate found (service 0x1828, or a name matching the meter).")
         print("wake the meter (pedal once) and make sure no phone/computer is holding it.")
         return
 
@@ -317,7 +323,7 @@ async def main():
     async with BleakClient(dev) as client:
         print("connected")
         try:
-            await client.write_gatt_char(UUID_CP_CTRL, XDS_START_COMMAND, response=True)
+            await client.write_gatt_char(UUID_CP_CTRL, METER_START_COMMAND, response=True)
             print("start command sent to 0x2A55")
         except Exception as exc:
             print("write 0x2A55 failed: %s (continuing)" % exc)

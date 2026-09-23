@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XDS 功率计抓包脚本（正确版）
-============================
+功率计私有协议抓包脚本
+======================
 
-和之前 111.py 的区别 —— 之前抓的是厂商自定义特征值（a6ed0202…），
-那是状态/调试帧，不是功率数据。这个版本按 xds_forwarding 源码的权威做法：
+绕开桥，直接连功率计抓它的原始通知，用来核对协议字段。
+
+注意：厂商自定义特征值（形如 a6ed0202…）里是状态/调试帧，不是功率数据，
+不要抓那个。真正的功率数据在标准测量特征 0x2A63 里：
 
   1. 连上功率计
   2. 往 0x2A55（Cycling Power Control Point）写启动命令 02 16 AA 10
-     —— 不发这条，设备可能根本不上报功率
+     —— 实测本型号会回 0x81 拒绝，且不发也照样有测量数据，所以这步可跳过
   3. 订阅 0x2A63（Cycling Power Measurement）拿真正的功率数据
-  4. 按 xds_protocol.c 的偏移实时解析并打印
+  4. 按 meter_protocol.h 的偏移实时解析并打印
 
 用法：
     pip install bleak
 
-    python xds_capture.py                    # 自动扫描并连接
-    python xds_capture.py C0:A1:25:04:32:08  # 指定地址（更快）
-    python xds_capture.py --seconds 60       # 监听时长（默认 30 秒）
+    python meter_capture.py                    # 自动扫描并连接
+    python meter_capture.py C0:A1:25:04:32:08  # 指定地址（更快）
+    python meter_capture.py --seconds 60       # 监听时长（默认 30 秒）
 
 注意：
   - 功率计通常只允许一个中央设备连接。跑之前请关掉手机 App / 码表的蓝牙连接。
   - 踩一下曲柄唤醒功率计，否则它不广播。
-  - 标准 CP 服务是 0x1828，测量特征 0x2A63，控制点 0x2A55。
+  - 这台功率计的服务 UUID 是厂商私有的 0x1828（按标准它其实是 Mesh Proxy），
+    测量特征 0x2A63，控制点 0x2A55。
 """
 
 import argparse
@@ -42,22 +45,24 @@ except ImportError:
 
 # 标准 Bluetooth SIG UUID（16 位短 UUID 展开成 128 位基准形式）
 BASE = "0000{}-0000-1000-8000-00805f9b34fb"
-UUID_CP_SERVICE = BASE.format("1828")   # Cycling Power 服务
+UUID_CP_SERVICE = BASE.format("1828")   # 这台功率计实际用的服务（私有）
+UUID_BRIDGE_SERVICE = BASE.format("1818")  # 我们自己的桥对外广播这个，扫描时要排除
 UUID_CP_MEAS = BASE.format("2a63")      # Cycling Power Measurement  ← 功率数据
-UUID_CP_CTRL = BASE.format("2a55")      # Cycling Power Control Point ← 写启动命令
+UUID_CP_CTRL = BASE.format("2a55")      # Cycling Power Control Point ← 启动命令
 
-# XDS 私有启动命令（来自 xds_forwarding 的 xds_start_command_send）
-XDS_START_COMMAND = bytes([0x02, 0x16, 0xAA, 0x10])
+# 厂商私有启动命令。实测本型号返回 0x81 拒绝，跳过也不影响收数据，
+# 保留它是为了换型号时还能试一下。
+METER_START_COMMAND = bytes([0x02, 0x16, 0xAA, 0x10])
 
 DEFAULT_ADDRESS = "C0:A1:25:04:32:08"
 
 
 # ---------------------------------------------------------------------------
-# 解析：完全按 xds_protocol.c 的偏移
+# 解析：与 src/meter_protocol.c 的偏移一致
 # ---------------------------------------------------------------------------
 
-def parse_xds_payload(payload):
-    """按 xds_protocol.c 解析 11 字节负载。
+def parse_meter_payload(payload):
+    """按 src/meter_protocol.h 解析 11 字节负载。
 
     返回 dict；长度不足的字段返回 None（对应 C 代码里的 length>=N 判断）。
     """
@@ -127,13 +132,13 @@ class Capture:
             self.first_at = now
         self.last_at = now
 
-        r = parse_xds_payload(data)
+        r = parse_meter_payload(data)
         std = parse_standard_cp(data)
 
         head = "[%3d]" % self.count
         raw = data.hex().upper()
 
-        # 解析结果（按 xds_protocol.c）
+        # 解析结果（按 src/meter_protocol.h 的偏移）
         parts = []
         if r["total_power_w"] is not None:
             parts.append("总功率=%s W" % r["total_power_w"])
@@ -182,12 +187,16 @@ async def find_device(address):
     for dev, adv in devices.values():
         name = (adv.local_name or dev.name or "")
         uuids = [u.lower() for u in (adv.service_uuids or [])]
-        # 认标准 CP 服务，或名字里带 XDS
-        hit = UUID_CP_SERVICE in uuids or "xds" in name.lower()
+        low = name.lower()
+        # 认 0x1828 服务；有些型号广播里不带服务 UUID，退回按名字认。
+        # 排除我们自己的桥（广播 0x1818、名字含 bridge）。
+        hit = (UUID_CP_SERVICE in uuids) or ("xds-" in low)
+        if (UUID_BRIDGE_SERVICE in uuids) or ("bridge" in low):
+            hit = False
         if hit:
             cands.append((dev, name, uuids))
     if not cands:
-        print("没找到带 0x1828 服务或名字含 XDS 的设备。附近设备列表：")
+        print("没找到带 0x1828 服务的设备。附近设备列表：")
         for dev, adv in devices.values():
             print("   %-20s %s" % (adv.local_name or dev.name or "(无名)", dev.address))
         return None
@@ -203,7 +212,7 @@ async def main():
                     help="功率计 BLE 地址；不填则自动扫描")
     ap.add_argument("--seconds", type=int, default=30, help="监听时长，默认 30 秒")
     ap.add_argument("--no-start", action="store_true",
-                    help="不发 XDS 启动命令（用于对比测试）")
+                    help="不发启动命令（用于对比测试）")
     args = ap.parse_args()
 
     addr = args.address or DEFAULT_ADDRESS
@@ -219,12 +228,12 @@ async def main():
     async with BleakClient(dev, timeout=20.0) as client:
         print("已连接")
 
-        # 1) 先发 XDS 启动命令（关键步骤）
+        # 1) 先发启动命令（实测本型号会拒绝，但不影响后续订阅）
         if not args.no_start:
             try:
-                await client.write_gatt_char(UUID_CP_CTRL, XDS_START_COMMAND,
+                await client.write_gatt_char(UUID_CP_CTRL, METER_START_COMMAND,
                                              response=True)
-                print("已发送启动命令 %s 到 0x2A55" % XDS_START_COMMAND.hex().upper())
+                print("已发送启动命令 %s 到 0x2A55" % METER_START_COMMAND.hex().upper())
             except Exception as exc:
                 print("!! 写 0x2A55 失败：%s" % exc)
                 print("   （有些功率计不需要这条命令，继续尝试订阅）")

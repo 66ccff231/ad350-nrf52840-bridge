@@ -8,7 +8,7 @@ from bleak import BleakClient, BleakScanner
 
 BASE = "0000{}-0000-1000-8000-00805f9b34fb"
 UUID_CPM = BASE.format("2a63")
-TARGET = "XDS Power Bridge"
+TARGET = "Power Meter Bridge"
 
 
 def parse(payload):

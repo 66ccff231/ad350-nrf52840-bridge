@@ -4,7 +4,7 @@ import sys
 
 from bleak import BleakScanner
 
-TARGET = "XDS Power Bridge"
+TARGET = "Power Meter Bridge"
 
 KNOWN = {
     "00001800-0000-1000-8000-00805f9b34fb": "Generic Access",

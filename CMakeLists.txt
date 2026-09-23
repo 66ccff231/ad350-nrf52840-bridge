@@ -1,17 +1,17 @@
-# XDS 功率计 BLE 桥接固件（nRF52840 / Zephyr）
+# 功率计 BLE 桥接固件（nRF52840 / Zephyr）
 #
-# 把 XDS 功率计的测量数据转成标准 BLE Cycling Power 服务广播出去，
-# 让行者 app / 行者小G+ 第三代当作普通蓝牙功率计来连接。
+# 把功率计的私有测量数据转成标准 BLE Cycling Power 服务（0x1818）广播出去，
+# 让手机 app / 码表当作普通蓝牙功率计来连接。
 #
-# 为什么不用 ANT+：G3+ 官方规格支持「ANT+/蓝牙双连接，功率计均可连」，
-# 行者也说明第三方传感器可搜到即连。走 BLE 就完全绕开 ANT 协议栈与 Garmin 许可。
+# 为什么不用 ANT+：本板没有 SWD 编程器，而 ANT SoftDevice 会覆盖 UF2 引导器；
+# 且 ANT+ 需 Garmin 授权、SoftDevice 许可也限制用途。走 BLE 完全绕开这些。
 
 cmake_minimum_required(VERSION 3.20.0)
 
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(xds_ble_bridge)
+project(ble_power_bridge)
 
 target_sources(app PRIVATE
     src/main.c
-    src/xds_protocol.c
+    src/meter_protocol.c
 )
