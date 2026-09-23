@@ -208,8 +208,23 @@ static uint8_t measurement_buf[8];
 static uint16_t crank_revs;        /* 累计曲柄圈数 */
 static uint16_t crank_evt_time;    /* 上次曲柄事件时间，1/1024 秒 */
 static uint32_t crank_last_ms;     /* 上次更新的时刻 */
-static uint32_t crank_frac_mrev;   /* 未满一圈的千分比余数，避免整数截断丢圈 */
+static uint32_t crank_phase_ms;    /* 当前这一圈已经走了多少毫秒 */
 
+/* 曲柄数据是 CPS 里唯一的踏频载体：协议没有单独的「踏频」字段，接收端
+ * 一律用
+ *      踏频 = Δ圈数 / Δ事件时间
+ * 反推。所以事件时间**必须和圈数一一对应**。
+ *
+ * ⚠️ 曾经踩过的坑（实测 Wahoo 平均 60、峰值 254 rpm）：
+ *   把事件时间按墙上时钟匀速推进（每次 +dt），圈数却按踏频积分攒够一圈才加。
+ *   于是 85 rpm 时每秒圈数是 1,1,2,1,1,2…，事件时间却恒 +1024，
+ *   接收端读到 60,60,120,60… 来回跳；
+ *   而 update_crank() 由计通知和主循环各触发一次，两次挨得极近时 dt<1ms，
+ *   (dt*1024)/1000 取整成 0 → Δ事件时间=0 而 Δ圈数=1 → 接收端除零 → 254 rpm。
+ *
+ * 正确做法：事件时间只在真正转满一圈时推进，且增量严格等于那一圈的周期。
+ * 这样任意两次通知之间的 Δ圈数/Δ事件时间 都恒等于真实踏频，
+ * 和通知的快慢、抖动彻底解耦。 */
 static void update_crank(uint16_t cadence_rpm)
 {
     uint32_t now = k_uptime_get_32();
@@ -227,20 +242,41 @@ static void update_crank(uint16_t cadence_rpm)
         return;
     }
 
-    /* 时间戳始终推进（即使没踏频），符合 CPS 对事件时间的定义 */
-    crank_evt_time = (uint16_t)(crank_evt_time + ((dt * 1024U) / 1000U));
+    /* 没人订阅时本函数根本不会被调用（notify_work_handler 提前返回），
+     * 等新设备订阅上来 dt 可能已是几分钟。这种「断档」一律当成重新开始，
+     * 否则会按上次的踏频一口气补出上千圈，累计值瞬间跳一大截。 */
+    if (dt > 2000U)
+    {
+        crank_phase_ms = 0U;
+        return;
+    }
 
     if (cadence_rpm == 0U)
     {
-        return;   /* 没踩就不加圈数 */
+        /* 停踩：圈内相位归零，事件时间原地不动。
+         * 接收端看到 Δ圈数=0 且 Δ事件时间=0，就会把踏频判为 0。 */
+        crank_phase_ms = 0U;
+        return;
     }
 
-    /* 圈数增量 = rpm * dt(ms) / 60000，用千分之一圈定点累计避免丢圈 */
-    crank_frac_mrev += ((uint32_t)cadence_rpm * dt * 1000U) / 60000U;
-    while (crank_frac_mrev >= 1000U)
+    uint32_t period_ms = 60000U / cadence_rpm;      /* 转一圈要多少毫秒 */
+    if (period_ms == 0U)
     {
-        crank_frac_mrev -= 1000U;
+        period_ms = 1U;
+    }
+
+    uint32_t evt_step = 61440U / cadence_rpm;       /* 60 * 1024 / rpm */
+    if (evt_step == 0U)
+    {
+        evt_step = 1U;
+    }
+
+    crank_phase_ms += dt;
+    while (crank_phase_ms >= period_ms)
+    {
+        crank_phase_ms -= period_ms;
         crank_revs++;
+        crank_evt_time = (uint16_t)(crank_evt_time + evt_step);
     }
 }
 
@@ -407,8 +443,8 @@ static uint8_t notify_func(struct bt_conn *conn,
             m.total_power_w, m.cadence_rpm, m.left_power_w,
             m.right_power_w, m.angle_deg, m.error_code);
 
-    /* 同时打印原始字节：偏移 0-1 的「总功率」还没在真实负载下验证过，
-     * 有原始数据才能回头核对字段位置。 */
+    /* 同时打印原始字节。偏移 0-1 的「总功率」已在真实骑行负载下验证
+     * （Wahoo 与官方 app 平均 63 W / 峰值 232 W 一致），留着他日核对字段。 */
     LOG_HEXDUMP_INF(data, length, "原始负载");
 
     k_work_submit(&notify_work);
