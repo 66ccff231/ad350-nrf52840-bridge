@@ -44,9 +44,14 @@
 LOG_MODULE_REGISTER(ble_power_bridge, LOG_LEVEL_INF);
 
 /* ------------------------------------------------------------------ */
-/* 状态指示灯（板载红色 LED，P0.15，高电平点亮）                       */
-/*   板子定义来自 Zephyr 的 boards/others/promicro_nrf52840：          */
+/* 状态指示灯（板载用户 LED，P0.15，高电平点亮）                       */
+/*   引脚来自 Zephyr 的 boards/others/promicro_nrf52840：              */
 /*     led0: led_0 { gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>; }           */
+/*                                                                     */
+/*   ⚠️ 颜色随批次而异，别照颜色认。Zephyr 的板级定义把它标成           */
+/*   "Red LED"，但这一族板子（nice!nano / SuperMini / ProMicro /        */
+/*   Mikoto …）同一个 P0.15 上可能是蓝灯、红灯或绿灯。                  */
+/*   固件行为与颜色无关，只认引脚。                                     */
 /*                                                                     */
 /*   为什么要这个：脱离电脑使用时看不到日志，LED 是唯一的状态反馈。      */
 /*     慢闪(1Hz)  正在扫描功率计                                        */
